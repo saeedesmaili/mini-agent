@@ -25,6 +25,7 @@ you to access system resources.
 <file-system-paths>
 Special file system paths:
 
+/data/                user-provided input files (e.g., CSV files for analysis).
 /network/current-ip   has the current IP address.
 /output               files produced here the user can see.
 </file-system-paths>
@@ -44,6 +45,7 @@ class AgentState {
     this.outputCapture = data.outputCapture || { stdout: "", stderr: "" };
     this.networkCache = data.networkCache || {};
     this.outputFiles = data.outputFiles || {};
+    this.inputFiles = data.inputFiles || {};
     this.done = data.done || false;
     this.metadata = data.metadata || {
       taskId: null,
@@ -60,6 +62,7 @@ class AgentState {
       outputCapture: this.outputCapture,
       networkCache: this.networkCache,
       outputFiles: this.outputFiles,
+      inputFiles: this.inputFiles,
       done: this.done,
       metadata: {
         ...this.metadata,
@@ -126,6 +129,22 @@ class AgentState {
         pyodide.FS.writeFile(pyodidePath, new Uint8Array(buffer));
       } catch (err) {
         console.error(`Error restoring ${filename}: ${err.message}`);
+      }
+    }
+  }
+
+  restoreInputFiles(pyodide) {
+    try {
+      pyodide.FS.mkdir("/data");
+    } catch {}
+
+    for (const [filename, base64Data] of Object.entries(this.inputFiles)) {
+      const pyodidePath = `/data/${filename}`;
+      try {
+        const buffer = Buffer.from(base64Data, "base64");
+        pyodide.FS.writeFile(pyodidePath, new Uint8Array(buffer));
+      } catch (err) {
+        console.error(`Error restoring input file ${filename}: ${err.message}`);
       }
     }
   }
@@ -610,10 +629,23 @@ async function runAgenticStep(state, pyodide, networkFS, client, tools) {
   return state;
 }
 
+function loadUserFiles(state, filePaths) {
+  for (const filePath of filePaths) {
+    try {
+      const filename = path.basename(filePath);
+      const data = fs.readFileSync(filePath);
+      state.inputFiles[filename] = data.toString("base64");
+      console.log(`[Input] Loaded file: ${filename}`);
+    } catch (err) {
+      console.error(`[Input] Error loading ${filePath}: ${err.message}`);
+    }
+  }
+}
+
 // Orchestrates the whole durable loop: bootstrap Pyodide, replay cached state if available, and
 // keep iterating until the model declares victory or we hit the step budget.
 async function agenticLoop(taskId, initialState, options = {}) {
-  const { maxSteps = 10, useCache = true, clearCacheOnStart = false } = options;
+  const { maxSteps = 10, useCache = true, clearCacheOnStart = false, inputFiles = [] } = options;
 
   // Clear cache if requested
   if (clearCacheOnStart) {
@@ -623,6 +655,11 @@ async function agenticLoop(taskId, initialState, options = {}) {
   // Initialize environment
   let state = initialState;
   state.metadata.taskId = taskId;
+
+  // Load user-provided input files into state
+  if (inputFiles.length > 0) {
+    loadUserFiles(state, inputFiles);
+  }
 
   // Create output capture object that will be updated by Pyodide
   const outputCaptureRef = state.outputCapture;
@@ -644,6 +681,7 @@ async function agenticLoop(taskId, initialState, options = {}) {
   // Restore state to file systems if needed
   state.restoreNetworkCache(networkFS);
   state.restoreOutputFiles(pyodide);
+  state.restoreInputFiles(pyodide);
 
   // Initialize Anthropic client
   const client = new Anthropic({
@@ -710,15 +748,75 @@ async function agenticLoop(taskId, initialState, options = {}) {
   return state;
 }
 
+function getNextTaskId() {
+  const cacheDir = StateCache.cacheDir;
+  if (!fs.existsSync(cacheDir)) {
+    return "task-0";
+  }
+  const files = fs.readdirSync(cacheDir);
+  const taskNumbers = files
+    .map((f) => f.match(/^task-(\d+)-/))
+    .filter(Boolean)
+    .map((m) => parseInt(m[1], 10));
+  const maxTask = taskNumbers.length > 0 ? Math.max(...taskNumbers) : -1;
+  return `task-${maxTask + 1}`;
+}
+
 async function main() {
-  // Define task ID and initial state
-  const taskId = "task-0";
+  const args = process.argv.slice(2);
+
+  // Parse arguments: optional CSV file path and optional prompt
+  let inputFiles = [];
+  let userPrompt = "Figure out the current ip address and make me a picture of it";
+  let taskId = "task-0";
+  let isNewTask = false;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--file" || arg === "-f") {
+      if (args[i + 1]) {
+        inputFiles.push(path.resolve(args[i + 1]));
+        i++;
+      }
+    } else if (arg === "--prompt" || arg === "-p") {
+      if (args[i + 1]) {
+        userPrompt = args[i + 1];
+        i++;
+      }
+    } else if (arg === "--task" || arg === "-t") {
+      if (args[i + 1]) {
+        taskId = `task-${args[i + 1]}`;
+        i++;
+      }
+    } else if (arg === "--new" || arg === "-n") {
+      isNewTask = true;
+    } else if (arg.endsWith(".csv")) {
+      inputFiles.push(path.resolve(arg));
+    }
+  }
+
+  // If --new flag, generate a new task ID
+  if (isNewTask) {
+    taskId = getNextTaskId();
+  }
+
+  console.log(`[Task] Using task ID: ${taskId}`);
+
+  // If input files are provided, update the prompt to reference them
+  if (inputFiles.length > 0) {
+    const fileNames = inputFiles.map((f) => path.basename(f)).join(", ");
+    if (userPrompt === "Figure out the current ip address and make me a picture of it") {
+      userPrompt = `Analyze the CSV file(s) in /data/: ${fileNames}. Provide a summary of the data.`;
+    } else {
+      userPrompt = `I've provided the following file(s) in /data/: ${fileNames}\n\n${userPrompt}`;
+    }
+    console.log(`[Input] Files to load: ${fileNames}`);
+  }
   const initialState = new AgentState({
     messages: [
       {
         role: "user",
-        content:
-          "Figure out the current ip address and make me a picture of it",
+        content: userPrompt,
       },
     ],
     stepCount: 0,
@@ -729,6 +827,7 @@ async function main() {
     maxSteps: 10,
     useCache: true,
     clearCacheOnStart: false,
+    inputFiles,
   });
 
   // Expose final output files
@@ -739,3 +838,5 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
+
+// usage: node mini-agent.js --new --file data/superstore.csv --prompt "what's the net profit and net profit margin in 2017?"
